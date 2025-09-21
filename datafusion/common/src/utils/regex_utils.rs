@@ -4,14 +4,14 @@ use arrow::array::builder::{
 use arrow::array::cast::AsArray;
 use arrow::array::*;
 use arrow::error::ArrowError;
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{DataType, Field, UInt32Type};
 use regex::Regex;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 macro_rules! process_regexp_array_match {
-    ($array:expr, $regex_array:expr, $flags_array:expr, $list_builder:expr) => {
+    ($array:expr, $regex_array:expr, $flags_array:expr, $idx_array:expr, $list_builder:expr) => {
         let mut patterns: HashMap<String, Regex> = HashMap::new();
 
         let complete_pattern = match $flags_array {
@@ -33,7 +33,8 @@ macro_rules! process_regexp_array_match {
         $array
             .iter()
             .zip(complete_pattern)
-            .map(|(value, pattern)| {
+            .enumerate()
+            .map(|(i, (value, pattern))| {
                 match (value, pattern) {
                     // Required for Postgres compatibility:
                     // SELECT regexp_match('foobarbequebaz', ''); = {""}
@@ -56,12 +57,30 @@ macro_rules! process_regexp_array_match {
                         };
                         match re.captures(value) {
                             Some(caps) => {
-                                let mut iter = caps.iter();
-                                if caps.len() > 1 {
-                                    iter.next();
-                                }
-                                for m in iter.flatten() {
-                                    $list_builder.values().append_value(m.as_str());
+                                if let Some(index) = $idx_array {
+                                    // This should have already been checked to be the same length as the array
+                                    // But double check anyway
+                                    if !index.is_valid(i) {
+                                        // If the index is NULL, return NULL
+                                        $list_builder.append(false);
+                                        return Ok(());
+                                    }
+                                    let current_idx = index.value(i) as usize;
+                                    if let Some(v) = caps.get(current_idx) {
+                                        $list_builder.values().append_value(v.as_str());
+                                    } else {
+                                        // If the index is out of bounds, return NULL
+                                        $list_builder.append(false);
+                                        return Ok(());
+                                    }
+                                } else {
+                                    let mut iter = caps.iter();
+                                    if caps.len() > 1 {
+                                        iter.next();
+                                    }
+                                    for m in iter.flatten() {
+                                        $list_builder.values().append_value(m.as_str());
+                                    }
                                 }
 
                                 $list_builder.append(true);
@@ -81,11 +100,12 @@ fn regexp_array_match<OffsetSize: OffsetSizeTrait>(
     array: &GenericStringArray<OffsetSize>,
     regex_array: &GenericStringArray<OffsetSize>,
     flags_array: Option<&GenericStringArray<OffsetSize>>,
+    idx_array: Option<&PrimitiveArray<UInt32Type>>,
 ) -> Result<ArrayRef, ArrowError> {
     let builder: GenericStringBuilder<OffsetSize> = GenericStringBuilder::with_capacity(0, 0);
     let mut list_builder = ListBuilder::new(builder);
 
-    process_regexp_array_match!(array, regex_array, flags_array, list_builder);
+    process_regexp_array_match!(array, regex_array, flags_array, idx_array, list_builder);
 
     Ok(Arc::new(list_builder.finish()))
 }
@@ -94,11 +114,12 @@ fn regexp_array_match_utf8view(
     array: &StringViewArray,
     regex_array: &StringViewArray,
     flags_array: Option<&StringViewArray>,
+    idx_array: Option<&PrimitiveArray<UInt32Type>>,
 ) -> Result<ArrayRef, ArrowError> {
     let builder = StringViewBuilder::with_capacity(0);
     let mut list_builder = ListBuilder::new(builder);
 
-    process_regexp_array_match!(array, regex_array, flags_array, list_builder);
+    process_regexp_array_match!(array, regex_array, flags_array, idx_array, list_builder);
 
     Ok(Arc::new(list_builder.finish()))
 }
@@ -134,7 +155,7 @@ fn get_scalar_pattern_flag_utf8view<'a>(
 }
 
 macro_rules! process_regexp_match {
-    ($array:expr, $regex:expr, $list_builder:expr) => {
+    ($array:expr, $regex:expr, $list_builder:expr, $idx:expr) => {
         $array
             .iter()
             .map(|value| {
@@ -147,12 +168,22 @@ macro_rules! process_regexp_match {
                     }
                     Some(value) => match $regex.captures(value) {
                         Some(caps) => {
-                            let mut iter = caps.iter();
-                            if caps.len() > 1 {
-                                iter.next();
-                            }
-                            for m in iter.flatten() {
-                                $list_builder.values().append_value(m.as_str());
+                            if let Some(idx) = $idx {
+                                if let Some(v) = caps.get(*idx) {
+                                    $list_builder.values().append_value(v.as_str());
+                                } else {
+                                    // If the index is out of bounds, return NULL
+                                    $list_builder.append(false);
+                                    return Ok(());
+                                }
+                            } else {
+                                let mut iter = caps.iter();
+                                if caps.len() > 1 {
+                                    iter.next();
+                                }
+                                for m in iter.flatten() {
+                                    $list_builder.values().append_value(m.as_str());
+                                }
                             }
                             $list_builder.append(true);
                         }
@@ -169,11 +200,12 @@ macro_rules! process_regexp_match {
 fn regexp_scalar_match<OffsetSize: OffsetSizeTrait>(
     array: &GenericStringArray<OffsetSize>,
     regex: &Regex,
+    idx: &Option<usize>,
 ) -> Result<ArrayRef, ArrowError> {
     let builder: GenericStringBuilder<OffsetSize> = GenericStringBuilder::with_capacity(0, 0);
     let mut list_builder = ListBuilder::new(builder);
 
-    process_regexp_match!(array, regex, list_builder);
+    process_regexp_match!(array, regex, list_builder, idx);
 
     Ok(Arc::new(list_builder.finish()))
 }
@@ -181,11 +213,12 @@ fn regexp_scalar_match<OffsetSize: OffsetSizeTrait>(
 fn regexp_scalar_match_utf8view(
     array: &StringViewArray,
     regex: &Regex,
+    idx: &Option<usize>,
 ) -> Result<ArrayRef, ArrowError> {
     let builder = StringViewBuilder::with_capacity(0);
     let mut list_builder = ListBuilder::new(builder);
 
-    process_regexp_match!(array, regex, list_builder);
+    process_regexp_match!(array, regex, list_builder, idx);
 
     Ok(Arc::new(list_builder.finish()))
 }
@@ -218,6 +251,7 @@ pub fn regexp_match(
     array: &dyn Array,
     regex_array: &dyn Datum,
     flags_array: Option<&dyn Datum>,
+    idx_array: Option<&dyn Datum>,
 ) -> Result<ArrayRef, ArrowError> {
     let (rhs, is_rhs_scalar) = regex_array.get();
 
@@ -250,8 +284,23 @@ pub fn regexp_match(
         ));
     }
 
+    let (idx, is_idx_scalar) = match idx_array {
+        Some(idx) => {
+            let (idx, is_idx_scalar) = idx.get();
+            (Some(idx), Some(is_idx_scalar))
+        }
+        None => (None, None),
+    };
+
+    if is_idx_scalar.is_some() && is_rhs_scalar != is_idx_scalar.unwrap() {
+        return Err(ArrowError::ComputeError(
+            "regexp_match() requires both pattern and idx to be either scalar or array"
+                .to_string(),
+        ));
+    }
+
     if is_rhs_scalar {
-        // Regex and flag is scalars
+        // Regex, flag and idx are scalars
         let (regex, flag) = match rhs.data_type() {
             DataType::Utf8View => get_scalar_pattern_flag_utf8view(rhs, flags),
             DataType::Utf8 => get_scalar_pattern_flag::<i32>(rhs, flags),
@@ -286,31 +335,42 @@ pub fn regexp_match(
             ArrowError::ComputeError(format!("Regular expression did not compile: {e:?}"))
         })?;
 
+        let idx = idx.map(|val| val.as_primitive::<UInt32Type>().value(0) as usize);
+
         match array.data_type() {
-            DataType::Utf8View => regexp_scalar_match_utf8view(array.as_string_view(), &re),
-            DataType::Utf8 => regexp_scalar_match(array.as_string::<i32>(), &re),
-            DataType::LargeUtf8 => regexp_scalar_match(array.as_string::<i64>(), &re),
+            DataType::Utf8View => regexp_scalar_match_utf8view(array.as_string_view(), &re, &idx),
+            DataType::Utf8 => regexp_scalar_match(array.as_string::<i32>(), &re, &idx),
+            DataType::LargeUtf8 => regexp_scalar_match(array.as_string::<i64>(), &re, &idx),
             _ => Err(ArrowError::ComputeError(
                 "regexp_match() requires array to be either Utf8, Utf8View or LargeUtf8"
                     .to_string(),
             )),
         }
     } else {
+        let idx_array = idx.map(|idx| idx.as_primitive::<UInt32Type>());
+        if let Some(idx_array) = &idx_array {
+            if idx_array.len() != array.len() {
+                return Err(ArrowError::ComputeError(
+                    "regexp_match() requires idx to be the same length as array when idx is an array"
+                        .to_string(),
+                ));
+            }
+        }
         match array.data_type() {
             DataType::Utf8View => {
                 let regex_array = rhs.as_string_view();
                 let flags_array = flags.map(|flags| flags.as_string_view());
-                regexp_array_match_utf8view(array.as_string_view(), regex_array, flags_array)
+                regexp_array_match_utf8view(array.as_string_view(), regex_array, flags_array, idx_array)
             }
             DataType::Utf8 => {
                 let regex_array = rhs.as_string();
                 let flags_array = flags.map(|flags| flags.as_string());
-                regexp_array_match(array.as_string::<i32>(), regex_array, flags_array)
+                regexp_array_match(array.as_string::<i32>(), regex_array, flags_array, idx_array)
             }
             DataType::LargeUtf8 => {
                 let regex_array = rhs.as_string();
                 let flags_array = flags.map(|flags| flags.as_string());
-                regexp_array_match(array.as_string::<i64>(), regex_array, flags_array)
+                regexp_array_match(array.as_string::<i64>(), regex_array, flags_array, idx_array)
             }
             _ => Err(ArrowError::ComputeError(
                 "regexp_match() requires array to be either Utf8, Utf8View or LargeUtf8"

@@ -17,13 +17,11 @@
 
 use std::any::Any;
 
-use arrow::array::{Array, ArrayRef, AsArray, new_empty_array};
-use arrow::compute::kernels::regexp;
-use datafusion_common::{arrow_datafusion_err, DataFusionError};
+use arrow::array::ArrayRef;
+use datafusion_common::{arrow_datafusion_err, DataFusionError, exec_err, internal_err, Result, utils::regex_utils::regexp_match};
 use arrow::datatypes::{
-    DataType, Int32Type
+    DataType
 };
-use datafusion_common::{exec_err, internal_err, Result};
 use datafusion_expr::{
     ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
@@ -50,9 +48,9 @@ impl SparkRegexpExtract {
                     // Planner attempts coercion to the target type starting with the most preferred candidate.
                     // For example, given input `(Utf8View, Utf8)`, it first tries coercing to `(Utf8View, Utf8View)`.
                     // If that fails, it proceeds to `(Utf8, Utf8)`.
-                    TypeSignature::Exact(vec![Utf8View, Utf8View, Int32]),
-                    TypeSignature::Exact(vec![Utf8, Utf8, Int32]),
-                    TypeSignature::Exact(vec![LargeUtf8, LargeUtf8, Int32]),
+                    TypeSignature::Exact(vec![Utf8View, Utf8View, UInt32]),
+                    TypeSignature::Exact(vec![Utf8, Utf8, UInt32]),
+                    TypeSignature::Exact(vec![LargeUtf8, LargeUtf8, UInt32]),
                 ],
                 Volatility::Immutable,
             ),
@@ -103,31 +101,24 @@ fn spark_regexp_extract(args: &[ArrayRef]) -> Result<ArrayRef> {
         );
     };
 
-    let regex_matches = regexp::regexp_match(&args[0], &args[1], None)
+    let regex_matches = regexp_match(&args[0], &args[1], None, Some(&args[2]))
         .map_err(|e| arrow_datafusion_err!(e))?;
-    let idx = args[2].as_primitive::<Int32Type>();
-    let idx = idx.value(0) as usize;
 
-    if regex_matches.len() < idx {
-        // fmt.Println("Warning: idx {} is out of bounds, returning empty array", idx);
-        return Ok(new_empty_array(args[0].data_type()));
-    }
-
-    Ok(regex_matches.slice(idx - 1, 1))
+    Ok(regex_matches)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::function::regex::regexp_extract::spark_regexp_extract;
     use arrow::array::StringArray;
-    use arrow::array::{GenericStringBuilder, ListBuilder, Int32Array};
+    use arrow::array::{GenericStringBuilder, ListBuilder, UInt32Array};
     use std::sync::Arc;
 
     #[test]
     fn test_spark_regexp_extract() {
         let values = StringArray::from(vec!["abc"; 5]);
         let patterns =
-            StringArray::from(vec!["^(a)", "^(a)", "(b|d)", "(B|D)", "^(b|c)"]);
+            StringArray::from(vec!["^(a)", "^(a)", "(a)(b|d)", "(B|D)", "^(b|c)"]);
 
         let elem_builder: GenericStringBuilder<i32> = GenericStringBuilder::new();
         let mut expected_builder = ListBuilder::new(elem_builder);
@@ -140,7 +131,7 @@ mod tests {
         expected_builder.append(false);
         let expected = expected_builder.finish();
 
-        let idx = Int32Array::new(vec![1, 2, 3, 4].into(), None);
+        let idx = UInt32Array::new(vec![1, 3, 2, 1, 1].into(), None);
         let re = spark_regexp_extract(&[Arc::new(values), Arc::new(patterns), Arc::new(idx)]).unwrap();
 
         assert_eq!(re.as_ref(), &expected);
