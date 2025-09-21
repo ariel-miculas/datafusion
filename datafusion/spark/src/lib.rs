@@ -119,6 +119,7 @@ pub mod expr_fn {
     pub use super::function::math::expr_fn::*;
     pub use super::function::misc::expr_fn::*;
     pub use super::function::predicate::expr_fn::*;
+    pub use super::function::regex::expr_fn::*;
     pub use super::function::r#struct::expr_fn::*;
     pub use super::function::string::expr_fn::*;
     pub use super::function::table::expr_fn::*;
