@@ -15,16 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use crate::util::{BenchmarkRun, CommonOpt, QueryResult, print_memory_stats};
 use clap::Args;
 use datafusion::logical_expr::{ExplainFormat, ExplainOption};
 use datafusion::{
     error::{DataFusionError, Result},
-    prelude::SessionContext,
+    prelude::{JsonReadOptions, SessionContext},
 };
 use datafusion_common::exec_datafusion_err;
 use datafusion_common::instant::Instant;
@@ -38,6 +40,35 @@ const HITS_VIEW_DDL: &str = r#"CREATE VIEW hits AS
 SELECT * EXCEPT ("EventDate"),
        CAST(CAST("EventDate" AS INTEGER) AS DATE) AS "EventDate"
 FROM hits_raw"#;
+
+/// Input file format for the hits dataset.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileFormat {
+    Parquet,
+    Json,
+}
+
+impl FromStr for FileFormat {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "parquet" => Ok(Self::Parquet),
+            "json" => Ok(Self::Json),
+            other => Err(format!(
+                "Unknown format '{other}'; expected parquet or json"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for FileFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parquet => write!(f, "parquet"),
+            Self::Json => write!(f, "json"),
+        }
+    }
+}
 
 /// Driver program to run the ClickBench benchmark
 ///
@@ -66,14 +97,19 @@ pub struct RunOpt {
     #[command(flatten)]
     common: CommonOpt,
 
-    /// Path to hits.parquet (single file) or `hits_partitioned`
-    /// (partitioned, 100 files)
+    /// Path to the hits dataset file or directory.
+    /// For parquet: hits.parquet (single file) or `hits_partitioned` (100 files).
+    /// For json: hits.json (single NDJSON file, decompressed from hits.json.gz).
     #[arg(
         short = 'p',
         long = "path",
         default_value = "benchmarks/data/hits.parquet"
     )]
     path: PathBuf,
+
+    /// Input file format: parquet (default) or json
+    #[arg(long = "format", default_value = "parquet")]
+    format: FileFormat,
 
     /// Path to queries directory
     #[arg(
@@ -152,10 +188,14 @@ impl RunOpt {
             None => 0..=usize::MAX,
         };
 
-        // configure parquet options
         let mut config = self.common.config()?;
 
         if self.sorted_by.is_some() {
+            if self.format != FileFormat::Parquet {
+                return Err(exec_datafusion_err!(
+                    "--sorted-by is only supported with --format parquet"
+                ));
+            }
             println!("ℹ️  Data is registered with sort order");
 
             let has_prefer_sort = self
@@ -187,7 +227,7 @@ impl RunOpt {
             config = config.set_str(key, value);
         }
 
-        {
+        if self.format == FileFormat::Parquet {
             let parquet_options = &mut config.options_mut().execution.parquet;
             // The hits_partitioned dataset specifies string columns
             // as binary due to how it was written. Force it to strings
@@ -283,52 +323,60 @@ impl RunOpt {
         Ok(query_results)
     }
 
-    /// Registers the `hits.parquet` as a table named `hits`
-    /// If sorted_by is specified, uses CREATE EXTERNAL TABLE with WITH ORDER
+    /// Registers the hits dataset as a table named `hits_raw`, then creates
+    /// the `hits` view on top of it.
     async fn register_hits(&self, ctx: &SessionContext) -> Result<()> {
         let path = self.path.as_os_str().to_str().unwrap();
 
-        // If sorted_by is specified, use CREATE EXTERNAL TABLE with WITH ORDER
-        if let Some(ref sort_column) = self.sorted_by {
-            println!(
-                "Registering table with sort order: {} {}",
-                sort_column, self.sort_order
-            );
+        match self.format {
+            FileFormat::Json => {
+                println!("Registering '{path}' as JSON (NDJSON)");
+                ctx.register_json("hits_raw", path, JsonReadOptions::default())
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::Context(
+                            format!("Registering 'hits_raw' as {path}"),
+                            Box::new(e),
+                        )
+                    })?;
+            }
+            FileFormat::Parquet => {
+                // If sorted_by is specified, use CREATE EXTERNAL TABLE with WITH ORDER
+                if let Some(ref sort_column) = self.sorted_by {
+                    println!(
+                        "Registering table with sort order: {} {}",
+                        sort_column, self.sort_order
+                    );
 
-            // Escape column name with double quotes
-            let escaped_column = if sort_column.contains('"') {
-                sort_column.clone()
-            } else {
-                format!("\"{sort_column}\"")
-            };
+                    let escaped_column = if sort_column.contains('"') {
+                        sort_column.clone()
+                    } else {
+                        format!("\"{sort_column}\"")
+                    };
 
-            // Build CREATE EXTERNAL TABLE DDL with WITH ORDER clause
-            // Schema will be automatically inferred from the Parquet file
-            let create_table_sql = format!(
-                "CREATE EXTERNAL TABLE hits_raw \
-                 STORED AS PARQUET \
-                 LOCATION '{}' \
-                 WITH ORDER ({} {})",
-                path,
-                escaped_column,
-                self.sort_order.to_uppercase()
-            );
+                    let create_table_sql = format!(
+                        "CREATE EXTERNAL TABLE hits_raw \
+                         STORED AS PARQUET \
+                         LOCATION '{}' \
+                         WITH ORDER ({} {})",
+                        path,
+                        escaped_column,
+                        self.sort_order.to_uppercase()
+                    );
 
-            println!("Executing: {create_table_sql}");
-
-            // Execute the CREATE EXTERNAL TABLE statement
-            ctx.sql(&create_table_sql).await?.collect().await?;
-        } else {
-            // Original registration without sort order
-            let options = Default::default();
-            ctx.register_parquet("hits_raw", path, options)
-                .await
-                .map_err(|e| {
-                    DataFusionError::Context(
-                        format!("Registering 'hits_raw' as {path}"),
-                        Box::new(e),
-                    )
-                })?;
+                    println!("Executing: {create_table_sql}");
+                    ctx.sql(&create_table_sql).await?.collect().await?;
+                } else {
+                    ctx.register_parquet("hits_raw", path, Default::default())
+                        .await
+                        .map_err(|e| {
+                            DataFusionError::Context(
+                                format!("Registering 'hits_raw' as {path}"),
+                                Box::new(e),
+                            )
+                        })?;
+                }
+            }
         }
 
         // Create the hits view with EventDate transformation
