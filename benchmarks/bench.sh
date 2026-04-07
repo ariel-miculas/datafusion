@@ -213,6 +213,7 @@ main() {
                     data_h2o_join "MEDIUM"
                     data_h2o_join "BIG"
                     data_clickbench_1
+                    data_clickbench_2
                     data_clickbench_partitioned
                     data_imdb
                     # nlj uses range() function, no data generation needed
@@ -240,6 +241,9 @@ main() {
                     ;;
                 clickbench_1)
                     data_clickbench_1
+                    ;;
+                clickbench_2)
+                    data_clickbench_2
                     ;;
                 clickbench_partitioned)
                     data_clickbench_partitioned
@@ -445,6 +449,9 @@ main() {
                     ;;
                 clickbench_1)
                     run_clickbench_1
+                    ;;
+                clickbench_2)
+                    run_clickbench_2
                     ;;
                 clickbench_partitioned)
                     run_clickbench_partitioned
@@ -760,6 +767,27 @@ data_clickbench_1() {
     popd > /dev/null
 }
 
+# Downloads the single file hits.parquet ClickBench datasets from
+# https://github.com/ClickHouse/ClickBench/tree/main#data-loading
+#
+# Creates data in $DATA_DIR/hits.json
+data_clickbench_2() {
+    pushd "${DATA_DIR}" > /dev/null
+
+    # Avoid downloading if it already exists and is the right size
+    OUTPUT_SIZE=$(wc -c hits.json  2>/dev/null  | awk '{print $1}' || true)
+    echo -n "Checking hits.parquet..."
+    if test "${OUTPUT_SIZE}" = "14779976446"; then
+        echo -n "... found ${OUTPUT_SIZE} bytes ..."
+    else
+        URL="https://datasets.clickhouse.com/hits_compatible/hits.json"
+        echo -n "... downloading ${URL} (14GB) ... "
+        wget --continue ${URL}
+    fi
+    echo " Done"
+    popd > /dev/null
+}
+
 # Downloads the 100 file partitioned ClickBench datasets from
 # https://github.com/ClickHouse/ClickBench/tree/main#data-loading
 #
@@ -790,6 +818,14 @@ run_clickbench_1() {
     echo "RESULTS_FILE: ${RESULTS_FILE}"
     echo "Running clickbench (1 file) benchmark..."
     debug_run $CARGO_COMMAND --bin dfbench -- clickbench  --iterations 5 --path "${DATA_DIR}/hits.parquet"  --queries-path "${SCRIPT_DIR}/queries/clickbench/queries" -o "${RESULTS_FILE}" ${QUERY_ARG} ${LATENCY_ARG}
+}
+
+# Runs the clickbench benchmark with a single large parquet file
+run_clickbench_2() {
+    RESULTS_FILE="${RESULTS_DIR}/clickbench_2.json"
+    echo "RESULTS_FILE: ${RESULTS_FILE}"
+    echo "Running clickbench (1 file) benchmark..."
+    debug_run $CARGO_COMMAND --bin dfbench -- clickbench  --iterations 5 --path "${DATA_DIR}/hits.json" --format json --queries-path "${SCRIPT_DIR}/queries/clickbench/queries" -o "${RESULTS_FILE}" ${QUERY_ARG} ${LATENCY_ARG}
 }
 
  # Runs the clickbench benchmark with the partitioned parquet dataset (100 files)
