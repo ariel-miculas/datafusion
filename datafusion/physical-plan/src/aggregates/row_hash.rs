@@ -63,7 +63,7 @@ pub(crate) enum ExecutionState {
     ReadingInput,
     /// When producing output, the remaining rows to output are stored
     /// here and are sliced off as needed in batch_size chunks
-    ProducingOutput(RecordBatch),
+    ProducingOutput(EmitTo),
     /// Produce intermediate aggregate state for each input row without
     /// aggregation.
     ///
@@ -753,10 +753,8 @@ impl Stream for GroupedHashAggregateStream {
                                 && let Some(to_emit) = self.group_ordering.emit_to()
                             {
                                 timer.done();
-                                if let Some(batch) = self.emit(to_emit, false)? {
-                                    self.exec_state =
-                                        ExecutionState::ProducingOutput(batch);
-                                };
+                                self.exec_state =
+                                    ExecutionState::ProducingOutput(to_emit);
                                 // make sure the exec_state just set is not overwritten below
                                 break 'reading_input;
                             }
@@ -837,33 +835,58 @@ impl Stream for GroupedHashAggregateStream {
                     }
                 }
 
-                ExecutionState::ProducingOutput(batch) => {
+                ExecutionState::ProducingOutput(to_emit) => {
                     // slice off a part of the batch, if needed
-                    let output_batch;
                     let size = self.batch_size;
-                    (self.exec_state, output_batch) = if batch.num_rows() <= size {
-                        (
-                            if self.input_done {
-                                ExecutionState::Done
-                            }
-                            // In Partial aggregation, we also need to check
-                            // if we should trigger partial skipping
-                            else if self.mode == AggregateMode::Partial
-                                && self.should_skip_aggregation()
-                            {
-                                ExecutionState::SkippingAggregation
+                    let (batch, remaining) = match to_emit {
+                        EmitTo::All => {
+                            let to_produce = std::cmp::min(size, self.group_values.len());
+                            (
+                                if to_produce > 0 {
+                                    self.emit(EmitTo::First(to_produce), false)?
+                                } else {
+                                    None
+                                },
+                                EmitTo::All,
+                            )
+                        }
+                        &EmitTo::First(n) => {
+                            let to_emit = std::cmp::min(n, size);
+                            if to_emit > 0 {
+                                (
+                                    self.emit(EmitTo::First(to_emit), false)?,
+                                    EmitTo::First(n.saturating_sub(to_emit)),
+                                )
                             } else {
-                                ExecutionState::ReadingInput
-                            },
-                            batch.clone(),
-                        )
+                                (None, EmitTo::First(0))
+                            }
+                        }
+                    };
+
+                    let num_rows = batch.as_ref().map(|b| b.num_rows()).unwrap_or(0);
+
+                    self.exec_state = if num_rows < size {
+                        if self.input_done {
+                            ExecutionState::Done
+                        }
+                        // In Partial aggregation, we also need to check
+                        // if we should trigger partial skipping
+                        else if self.mode == AggregateMode::Partial
+                            && self.should_skip_aggregation()
+                        {
+                            ExecutionState::SkippingAggregation
+                        } else {
+                            ExecutionState::ReadingInput
+                        }
                     } else {
                         // output first batch_size rows
-                        let size = self.batch_size;
-                        let num_remaining = batch.num_rows() - size;
-                        let remaining = batch.slice(size, num_remaining);
-                        let output = batch.slice(0, size);
-                        (ExecutionState::ProducingOutput(remaining), output)
+                        ExecutionState::ProducingOutput(remaining)
+                    };
+
+                    let output_batch = match batch {
+                        // it could be that no batch was emitted
+                        None => continue,
+                        Some(b) => b,
                     };
 
                     if let Some(reduction_factor) = self.reduction_factor.as_ref() {
@@ -1047,10 +1070,8 @@ impl GroupedHashAggregateStream {
                     },
                 };
 
-                if n > 0
-                    && let Some(batch) = self.emit(EmitTo::First(n), false)?
-                {
-                    Ok(Some(ExecutionState::ProducingOutput(batch)))
+                if n > 0 {
+                    Ok(Some(ExecutionState::ProducingOutput(EmitTo::First(n))))
                 } else {
                     Err(oom)
                 }
@@ -1230,12 +1251,7 @@ impl GroupedHashAggregateStream {
         let timer = elapsed_compute.timer();
         self.exec_state = if self.spill_state.spills.is_empty() {
             // Input has been entirely processed without spilling to disk.
-
-            // Flush any remaining group values.
-            let batch = self.emit(EmitTo::All, false)?;
-
-            // If there are none, we're done; otherwise switch to emitting them
-            batch.map_or(ExecutionState::Done, ExecutionState::ProducingOutput)
+            ExecutionState::ProducingOutput(EmitTo::All)
         } else {
             // Spill any remaining data to disk. There is some performance overhead in
             // writing out this last chunk of data and reading it back. The benefit of
@@ -1312,9 +1328,8 @@ impl GroupedHashAggregateStream {
     fn switch_to_skip_aggregation(&mut self) -> Result<Option<ExecutionState>> {
         if let Some(probe) = self.skip_aggregation_probe.as_mut()
             && probe.should_skip()
-            && let Some(batch) = self.emit(EmitTo::All, false)?
         {
-            return Ok(Some(ExecutionState::ProducingOutput(batch)));
+            return Ok(Some(ExecutionState::ProducingOutput(EmitTo::All)));
         };
 
         Ok(None)
