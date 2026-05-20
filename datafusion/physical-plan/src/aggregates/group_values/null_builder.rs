@@ -87,7 +87,11 @@ impl MaybeNullBufferBuilder {
 
         // take only first n values from the original builder
         new_builder.truncate(n);
-        new_builder.finish()
+        let mut buffer = new_builder.finish();
+        if let Some(b) = buffer.as_mut() {
+            b.shrink_to_fit()
+        }
+        buffer
     }
 
     /// Returns true if this builder might have any nulls

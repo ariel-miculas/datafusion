@@ -401,7 +401,8 @@ where
         // Find out a way to avoid copying buffer but split the original one into two.
         remaining_buffer.append_slice(&self.buffer.as_slice()[first_remaining_offset..]);
         self.buffer.truncate(first_remaining_offset);
-        let values = self.buffer.finish();
+        let mut values = self.buffer.finish();
+        values.shrink_to_fit();
         self.buffer = remaining_buffer;
 
         match self.output_type {
