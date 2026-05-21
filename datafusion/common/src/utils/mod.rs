@@ -579,6 +579,7 @@ pub fn split_vec_min_alloc<T>(vec: &mut Vec<T>, n: usize) -> Vec<T> {
         vec.drain(0..n).collect()
     } else {
         let remaining = vec.split_off(n);
+        vec.shrink_to_fit();
         mem::replace(vec, remaining)
     }
 }
