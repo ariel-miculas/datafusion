@@ -41,6 +41,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 use std::thread::available_parallelism;
+use std::mem;
 
 /// Applies an optional projection to a [`SchemaRef`], returning the
 /// projected schema
@@ -566,6 +567,19 @@ pub fn base_type(data_type: &DataType) -> DataType {
         | DataType::LargeList(field)
         | DataType::FixedSizeList(field, _) => base_type(field.data_type()),
         _ => data_type.to_owned(),
+    }
+}
+
+/// Splits `vec` at `n`, returning the first `n` elements and leaving the
+/// remainder in `vec`. Allocates for whichever portion is smaller to minimize
+/// peak memory: `drain+collect` when `n <= remaining`, `split_off+replace`
+/// when `remaining < n`.
+pub fn split_vec_min_alloc<T>(vec: &mut Vec<T>, n: usize) -> Vec<T> {
+    if n * 2 <= vec.len() {
+        vec.drain(0..n).collect()
+    } else {
+        let remaining = vec.split_off(n);
+        mem::replace(vec, remaining)
     }
 }
 
@@ -1259,6 +1273,49 @@ mod tests {
         assert_eq!(set_difference([3, 4, 0], [1, 2, 4]), vec![3, 0]);
         assert_eq!(set_difference([0, 3, 4], [4, 1, 2]), vec![0, 3]);
         assert_eq!(set_difference([3, 4, 0], [4, 1, 2]), vec![3, 0]);
+    }
+
+    #[test]
+    fn test_split_vec_min_alloc_drain_branch() {
+        // n * 2 <= len  →  drain+collect branch (allocates n elements)
+        let mut v = vec![1, 2, 3, 4, 5, 6];
+        let first = split_vec_min_alloc(&mut v, 2);
+        assert_eq!(first, vec![1, 2]);
+        assert_eq!(v, vec![3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_split_vec_min_alloc_split_off_branch() {
+        // remaining < n  →  split_off+replace branch (allocates remaining elements)
+        let mut v = vec![1, 2, 3, 4, 5, 6];
+        let first = split_vec_min_alloc(&mut v, 4);
+        assert_eq!(first, vec![1, 2, 3, 4]);
+        assert_eq!(v, vec![5, 6]);
+    }
+
+    #[test]
+    fn test_split_vec_min_alloc_exactly_half() {
+        // n * 2 == len  →  drain branch (boundary condition)
+        let mut v = vec![1, 2, 3, 4];
+        let first = split_vec_min_alloc(&mut v, 2);
+        assert_eq!(first, vec![1, 2]);
+        assert_eq!(v, vec![3, 4]);
+    }
+
+    #[test]
+    fn test_split_vec_min_alloc_take_all() {
+        let mut v = vec![1, 2, 3];
+        let first = split_vec_min_alloc(&mut v, 3);
+        assert_eq!(first, vec![1, 2, 3]);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn test_split_vec_min_alloc_take_none() {
+        let mut v = vec![1, 2, 3];
+        let first = split_vec_min_alloc(&mut v, 0);
+        assert!(first.is_empty());
+        assert_eq!(v, vec![1, 2, 3]);
     }
 
     #[test]
